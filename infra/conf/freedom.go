@@ -1,137 +1,138 @@
 package conf
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"net"
-	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/xtls/xray-core/common/errors"
 	v2net "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/freedom"
+	"google.golang.org/protobuf/proto"
 )
 
 type FreedomConfig struct {
 	DomainStrategy string    `json:"domainStrategy"`
-	Timeout        *uint32   `json:"timeout"`
 	Redirect       string    `json:"redirect"`
 	UserLevel      uint32    `json:"userLevel"`
 	Fragment       *Fragment `json:"fragment"`
+	Noise          *Noise    `json:"noise"`
+	Noises         []*Noise  `json:"noises"`
+	ProxyProtocol  uint32    `json:"proxyProtocol"`
 }
 
 type Fragment struct {
-	Packets  string `json:"packets"`
-	Length   string `json:"length"`
-	Interval string `json:"interval"`
+	Packets  string      `json:"packets"`
+	Length   *Int32Range `json:"length"`
+	Interval *Int32Range `json:"interval"`
+}
+
+type Noise struct {
+	Type   string      `json:"type"`
+	Packet string      `json:"packet"`
+	Delay  *Int32Range `json:"delay"`
 }
 
 // Build implements Buildable
 func (c *FreedomConfig) Build() (proto.Message, error) {
 	config := new(freedom.Config)
-	config.DomainStrategy = freedom.Config_AS_IS
 	switch strings.ToLower(c.DomainStrategy) {
-	case "useip", "use_ip", "use-ip":
+	case "asis", "":
+		config.DomainStrategy = freedom.Config_AS_IS
+	case "useip":
 		config.DomainStrategy = freedom.Config_USE_IP
-	case "useip4", "useipv4", "use_ip4", "use_ipv4", "use_ip_v4", "use-ip4", "use-ipv4", "use-ip-v4":
+	case "useipv4":
 		config.DomainStrategy = freedom.Config_USE_IP4
-	case "useip6", "useipv6", "use_ip6", "use_ipv6", "use_ip_v6", "use-ip6", "use-ipv6", "use-ip-v6":
+	case "useipv6":
 		config.DomainStrategy = freedom.Config_USE_IP6
+	case "useipv4v6":
+		config.DomainStrategy = freedom.Config_USE_IP46
+	case "useipv6v4":
+		config.DomainStrategy = freedom.Config_USE_IP64
+	case "forceip":
+		config.DomainStrategy = freedom.Config_FORCE_IP
+	case "forceipv4":
+		config.DomainStrategy = freedom.Config_FORCE_IP4
+	case "forceipv6":
+		config.DomainStrategy = freedom.Config_FORCE_IP6
+	case "forceipv4v6":
+		config.DomainStrategy = freedom.Config_FORCE_IP46
+	case "forceipv6v4":
+		config.DomainStrategy = freedom.Config_FORCE_IP64
+	default:
+		return nil, errors.New("unsupported domain strategy: ", c.DomainStrategy)
 	}
 
 	if c.Fragment != nil {
-		if len(c.Fragment.Interval) == 0 || len(c.Fragment.Length) == 0 {
-			return nil, newError("Invalid interval or length")
-		}
-		intervalMinMax := strings.Split(c.Fragment.Interval, "-")
-		var minInterval, maxInterval int64
-		var err, err2 error
-		if len(intervalMinMax) == 2 {
-			minInterval, err = strconv.ParseInt(intervalMinMax[0], 10, 64)
-			maxInterval, err2 = strconv.ParseInt(intervalMinMax[1], 10, 64)
-		} else {
-			minInterval, err = strconv.ParseInt(intervalMinMax[0], 10, 64)
-			maxInterval = minInterval
-		}
-		if err != nil {
-			return nil, newError("Invalid minimum interval: ", err).Base(err)
-		}
-		if err2 != nil {
-			return nil, newError("Invalid maximum interval: ", err2).Base(err2)
-		}
+		config.Fragment = new(freedom.Fragment)
 
-		lengthMinMax := strings.Split(c.Fragment.Length, "-")
-		var minLength, maxLength int64
-		if len(lengthMinMax) == 2 {
-			minLength, err = strconv.ParseInt(lengthMinMax[0], 10, 64)
-			maxLength, err2 = strconv.ParseInt(lengthMinMax[1], 10, 64)
-
-		} else {
-			minLength, err = strconv.ParseInt(lengthMinMax[0], 10, 64)
-			maxLength = minLength
-		}
-		if err != nil {
-			return nil, newError("Invalid minimum length: ", err).Base(err)
-		}
-		if err2 != nil {
-			return nil, newError("Invalid maximum length: ", err2).Base(err2)
-		}
-
-		if minInterval > maxInterval {
-			minInterval, maxInterval = maxInterval, minInterval
-		}
-		if minLength > maxLength {
-			minLength, maxLength = maxLength, minLength
-		}
-
-		config.Fragment = &freedom.Fragment{
-			MinInterval: int32(minInterval),
-			MaxInterval: int32(maxInterval),
-			MinLength:   int32(minLength),
-			MaxLength:   int32(maxLength),
-		}
-
-		if len(c.Fragment.Packets) > 0 {
-			packetRange := strings.Split(c.Fragment.Packets, "-")
-			var startPacket, endPacket int64
-			if len(packetRange) == 2 {
-				startPacket, err = strconv.ParseInt(packetRange[0], 10, 64)
-				endPacket, err2 = strconv.ParseInt(packetRange[1], 10, 64)
-			} else {
-				startPacket, err = strconv.ParseInt(packetRange[0], 10, 64)
-				endPacket = startPacket
-			}
+		switch strings.ToLower(c.Fragment.Packets) {
+		case "tlshello":
+			// TLS Hello Fragmentation (into multiple handshake messages)
+			config.Fragment.PacketsFrom = 0
+			config.Fragment.PacketsTo = 1
+		case "":
+			// TCP Segmentation (all packets)
+			config.Fragment.PacketsFrom = 0
+			config.Fragment.PacketsTo = 0
+		default:
+			// TCP Segmentation (range)
+			from, to, err := ParseRangeString(c.Fragment.Packets)
 			if err != nil {
-				return nil, newError("Invalid start packet: ", err).Base(err)
+				return nil, errors.New("Invalid PacketsFrom").Base(err)
 			}
-			if err2 != nil {
-				return nil, newError("Invalid end packet: ", err2).Base(err2)
+			config.Fragment.PacketsFrom = uint64(from)
+			config.Fragment.PacketsTo = uint64(to)
+			if config.Fragment.PacketsFrom == 0 {
+				return nil, errors.New("PacketsFrom can't be 0")
 			}
-			if startPacket > endPacket {
-				return nil, newError("Invalid packet range: ", c.Fragment.Packets)
+		}
+
+		{
+			if c.Fragment.Length == nil {
+				return nil, errors.New("Length can't be empty")
 			}
-			if startPacket < 1 {
-				return nil, newError("Cannot start from packet 0")
+			config.Fragment.LengthMin = uint64(c.Fragment.Length.From)
+			config.Fragment.LengthMax = uint64(c.Fragment.Length.To)
+			if config.Fragment.LengthMin == 0 {
+				return nil, errors.New("LengthMin can't be 0")
 			}
-			config.Fragment.StartPacket = int32(startPacket)
-			config.Fragment.EndPacket = int32(endPacket)
-		} else {
-			config.Fragment.StartPacket = 0
-			config.Fragment.EndPacket = 0
+		}
+
+		{
+			if c.Fragment.Interval == nil {
+				return nil, errors.New("Interval can't be empty")
+			}
+			config.Fragment.IntervalMin = uint64(c.Fragment.Interval.From)
+			config.Fragment.IntervalMax = uint64(c.Fragment.Interval.To)
 		}
 	}
 
-	if c.Timeout != nil {
-		config.Timeout = *c.Timeout
+	if c.Noise != nil {
+		return nil, errors.PrintRemovedFeatureError("noise = { ... }", "noises = [ { ... } ]")
 	}
+
+	if c.Noises != nil {
+		for _, n := range c.Noises {
+			NConfig, err := ParseNoise(n)
+			if err != nil {
+				return nil, err
+			}
+			config.Noises = append(config.Noises, NConfig)
+		}
+	}
+
 	config.UserLevel = c.UserLevel
 	if len(c.Redirect) > 0 {
 		host, portStr, err := net.SplitHostPort(c.Redirect)
 		if err != nil {
-			return nil, newError("invalid redirect address: ", c.Redirect, ": ", err).Base(err)
+			return nil, errors.New("invalid redirect address: ", c.Redirect, ": ", err).Base(err)
 		}
 		port, err := v2net.PortFromString(portStr)
 		if err != nil {
-			return nil, newError("invalid redirect port: ", c.Redirect, ": ", err).Base(err)
+			return nil, errors.New("invalid redirect port: ", c.Redirect, ": ", err).Base(err)
 		}
 		config.DestinationOverride = &freedom.DestinationOverride{
 			Server: &protocol.ServerEndpoint{
@@ -143,5 +144,54 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 			config.DestinationOverride.Server.Address = v2net.NewIPOrDomain(v2net.ParseAddress(host))
 		}
 	}
+	if c.ProxyProtocol > 0 && c.ProxyProtocol <= 2 {
+		config.ProxyProtocol = c.ProxyProtocol
+	}
 	return config, nil
+}
+
+func ParseNoise(noise *Noise) (*freedom.Noise, error) {
+	var err error
+	NConfig := new(freedom.Noise)
+	noise.Packet = strings.TrimSpace(noise.Packet)
+
+	switch noise.Type {
+	case "rand":
+		min, max, err := ParseRangeString(noise.Packet)
+		if err != nil {
+			return nil, errors.New("invalid value for rand Length").Base(err)
+		}
+		NConfig.LengthMin = uint64(min)
+		NConfig.LengthMax = uint64(max)
+		if NConfig.LengthMin == 0 {
+			return nil, errors.New("rand lengthMin or lengthMax cannot be 0")
+		}
+
+	case "str":
+		// user input string
+		NConfig.Packet = []byte(noise.Packet)
+
+	case "hex":
+		// user input hex
+		NConfig.Packet, err = hex.DecodeString(noise.Packet)
+		if err != nil {
+			return nil, errors.New("Invalid hex string").Base(err)
+		}
+
+	case "base64":
+		// user input base64
+		NConfig.Packet, err = base64.RawURLEncoding.DecodeString(strings.NewReplacer("+", "-", "/", "_", "=", "").Replace(noise.Packet))
+		if err != nil {
+			return nil, errors.New("Invalid base64 string").Base(err)
+		}
+
+	default:
+		return nil, errors.New("Invalid packet, only rand/str/hex/base64 are supported")
+	}
+
+	if noise.Delay != nil {
+		NConfig.DelayMin = uint64(noise.Delay.From)
+		NConfig.DelayMax = uint64(noise.Delay.To)
+	}
+	return NConfig, nil
 }
